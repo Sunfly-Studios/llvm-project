@@ -355,6 +355,13 @@ PreservedAnalyses GlobalDCEPass::run(Module &M, ModuleAnalysisManager &MAM) {
   std::vector<GlobalVariable *> DeadGlobalVars; // Keep track of dead globals
   for (GlobalVariable &GV : M.globals())
     if (!AliveGlobals.count(&GV)) {
+      // For COFF: Preserve COMDAT leaders if they have surviving associated members.
+      if (auto *C = GV.getComdat()) {
+        auto IsComdatLeaderWithUses =
+            C->getName() == GV.getName() && C->getUsers().size() > 1;
+        if (IsComdatLeaderWithUses)
+          continue;
+      }
       DeadGlobalVars.push_back(&GV);         // Keep track of dead globals
       if (GV.hasInitializer()) {
         Constant *Init = GV.getInitializer();
