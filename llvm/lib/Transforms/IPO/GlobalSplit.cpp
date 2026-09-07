@@ -164,6 +164,26 @@ static bool splitGlobal(GlobalVariable &GV) {
   // elements of the global, so replace with poison.
   if (!GV.use_empty())
     GV.replaceAllUsesWith(PoisonValue::get(GV.getType()));
+  
+  // For COFF, if the original global was a COMDAT leader, the comdat must contain
+  // a member with the same name. Transfer the name and linkage to the first split piece.
+  if (GV.hasComdat() && !SplitGlobals.empty()) {
+    StringRef ComdatName = GV.getComdat()->getName();
+    StringRef GlobalName = GV.getName();
+    if (GlobalName.starts_with("\01"))
+      GlobalName = GlobalName.drop_front(1);
+
+    // Ensure we only transfer names if the original global is
+    // definitively the COMDAT leader.
+    if (GV.getName() == GlobalName) {
+      SplitGlobals[0]->setComdat(GV.getComdat());
+      SplitGlobals[0]->setLinkage(GV.getLinkage());
+      
+      // Clear the original name so we can reuse it without auto-appending a suffix
+      GV.setName(""); 
+      SplitGlobals[0]->setName(GlobalName);
+    }
+  }
   GV.eraseFromParent();
   return true;
 }
