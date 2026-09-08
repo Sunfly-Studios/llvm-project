@@ -82,16 +82,38 @@ static Align getAlign(GlobalVariable *GV) {
       GV->getDataLayout().getPreferredAlign(GV));
 }
 
+static bool isComdatLeaderWithAliveMembers(GlobalVariable *GV, const SmallPtrSetImpl<const GlobalValue *> &UsedGlobals) {
+  if (const Comdat *C = GV->getComdat()) {
+    if (C->getName() == GV->getName()) {
+      for (const GlobalValue &Member : GV->getParent()->global_values()) {
+        if (Member.getComdat() == C && &Member != GV) {
+          if (!Member.use_empty() || !Member.isDiscardableIfUnused() || UsedGlobals.count(&Member)) {
+            return true;
+          }
+        }
+      }
+    }
+  }
+  return false;
+}
+
 static bool
 isUnmergeableGlobal(GlobalVariable *GV,
                     const SmallPtrSetImpl<const GlobalValue *> &UsedGlobals) {
   // Only process constants with initializers in the default address space.
-  return !GV->isConstant() || !GV->hasDefinitiveInitializer() ||
-         GV->getType()->getAddressSpace() != 0 || GV->hasSection() ||
-         // Don't touch thread-local variables.
-         GV->isThreadLocal() ||
-         // Don't touch values marked with attribute(used).
-         UsedGlobals.count(GV);
+  if (!GV->isConstant() || !GV->hasDefinitiveInitializer() ||
+      GV->getType()->getAddressSpace() != 0 || GV->hasSection() ||
+      // Don't touch thread-local variables.
+      GV->isThreadLocal() ||
+      // Don't touch values marked with attribute(used).
+      UsedGlobals.count(GV))
+    return true;
+
+  // FOR COFF: Prevent ConstantMerge from merging and destroying COMDAT leaders
+  if (isComdatLeaderWithAliveMembers(GV, UsedGlobals))
+    return true;
+
+  return false;
 }
 
 enum class CanMerge { No, Yes };
@@ -160,9 +182,11 @@ static bool mergeConstants(Module &M) {
       // If this GV is dead, remove it.
       GV.removeDeadConstantUsers();
       if (GV.use_empty() && GV.hasLocalLinkage()) {
-        GV.eraseFromParent();
-        ++ChangesMade;
-        continue;
+        if (!isComdatLeaderWithAliveMembers(&GV, UsedGlobals)) {
+          GV.eraseFromParent();
+          ++ChangesMade;
+          continue;
+        }
       }
 
       if (isUnmergeableGlobal(&GV, UsedGlobals))
