@@ -980,6 +980,14 @@ Expected<Constant *> IRLinker::linkGlobalValueProto(GlobalValue *SGV,
         Comdat *DC = DstM.getOrInsertComdat(SC->getName());
         DC->setSelectionKind(SC->getSelectionKind());
         GO->setComdat(DC);
+
+        // FOR COFF: Ensure COMDAT leader is materialized if any member is linked.
+        // If the linker pulls in an associative member, it must also pull in the leader.
+        if (GlobalValue *Leader = SGV->getParent()->getNamedValue(SC->getName())) {
+          if (Leader != SGV) {
+            maybeAdd(Leader);
+          }
+        }
       }
     }
   }
