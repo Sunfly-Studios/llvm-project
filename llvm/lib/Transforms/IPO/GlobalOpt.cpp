@@ -1325,6 +1325,21 @@ static bool TryToShrinkGlobalToBoolean(GlobalVariable *GV, Constant *OtherVal) {
   return true;
 }
 
+static bool isComdatLeaderWithAliveMembers(GlobalValue *GV) {
+  if (auto *C = GV->getComdat()) {
+    if (C->getName() == GV->getName()) {
+      for (const GlobalValue &Member : GV->getParent()->global_values()) {
+        if (Member.getComdat() == C && &Member != GV) {
+          if (!Member.use_empty() || !Member.isDiscardableIfUnused()) {
+            return true;
+          }
+        }
+      }
+    }
+  }
+  return false;
+}
+
 static bool
 deleteIfDead(GlobalValue &GV,
              SmallPtrSetImpl<const Comdat *> &NotDiscardableComdats,
@@ -1335,9 +1350,7 @@ deleteIfDead(GlobalValue &GV,
     return false;
 
   if (auto *C = GV.getComdat()) {
-    auto IsComdatLeaderWithUses =
-        C->getName() == GV.getName() && C->getUsers().size() > 1;
-    if (IsComdatLeaderWithUses ||
+    if (isComdatLeaderWithAliveMembers(&GV) ||
         (!GV.hasInternalLinkage() && NotDiscardableComdats.count(C)))
       return false;
   }
@@ -1470,6 +1483,11 @@ processInternalGlobal(GlobalVariable *GV, const GlobalStatus &GS,
                       function_ref<TargetTransformInfo &(Function &)> GetTTI,
                       function_ref<TargetLibraryInfo &(Function &)> GetTLI,
                       function_ref<DominatorTree &(Function &)> LookupDomTree) {
+  // FOR COFF: Prevent SRA, localization, or substitution of COMDAT leaders
+  // that have surviving associative members.
+  if (isComdatLeaderWithAliveMembers(GV))
+    return false;
+  
   auto &DL = GV->getDataLayout();
   // If this is a first class global and has only one accessing function and
   // this function is non-recursive, we replace the global with a local alloca
