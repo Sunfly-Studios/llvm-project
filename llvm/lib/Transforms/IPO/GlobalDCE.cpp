@@ -347,6 +347,24 @@ PreservedAnalyses GlobalDCEPass::run(Module &M, ModuleAnalysisManager &MAM) {
       MarkLive(*GVD, &NewLiveGVs);
   }
 
+  // For COFF: Two-pass COMDAT liveness check.
+  // Identify all COMDATs that have at least one alive member.
+  DenseSet<const Comdat *> AliveComdats;
+  for (GlobalValue &GV : M.global_values()) {
+    if (AliveGlobals.count(&GV)) {
+      if (const Comdat *C = GV.getComdat())
+        AliveComdats.insert(C);
+    }
+  }
+  
+  // Force all members of an alive COMDAT to survive.
+  for (GlobalValue &GV : M.global_values()) {
+    if (const Comdat *C = GV.getComdat()) {
+      if (AliveComdats.count(C))
+        AliveGlobals.insert(&GV);
+    }
+  }
+
   // Now that all globals which are needed are in the AliveGlobals set, we loop
   // through the program, deleting those which are not alive.
   //
@@ -355,13 +373,6 @@ PreservedAnalyses GlobalDCEPass::run(Module &M, ModuleAnalysisManager &MAM) {
   std::vector<GlobalVariable *> DeadGlobalVars; // Keep track of dead globals
   for (GlobalVariable &GV : M.globals())
     if (!AliveGlobals.count(&GV)) {
-      // For COFF: Preserve COMDAT leaders if they have surviving associated members.
-      if (auto *C = GV.getComdat()) {
-        auto IsComdatLeaderWithUses =
-            C->getName() == GV.getName() && C->getUsers().size() > 1;
-        if (IsComdatLeaderWithUses)
-          continue;
-      }
       DeadGlobalVars.push_back(&GV);         // Keep track of dead globals
       if (GV.hasInitializer()) {
         Constant *Init = GV.getInitializer();
