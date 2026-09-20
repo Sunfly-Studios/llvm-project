@@ -1325,24 +1325,10 @@ static bool TryToShrinkGlobalToBoolean(GlobalVariable *GV, Constant *OtherVal) {
   return true;
 }
 
-static bool isComdatLeaderWithAliveMembers(GlobalValue *GV) {
-  if (auto *C = GV->getComdat()) {
-    if (C->getName() == GV->getName()) {
-      for (const GlobalValue &Member : GV->getParent()->global_values()) {
-        if (Member.getComdat() == C && &Member != GV) {
-          if (!Member.use_empty() || !Member.isDiscardableIfUnused()) {
-            return true;
-          }
-        }
-      }
-    }
-  }
-  return false;
-}
-
 static bool
 deleteIfDead(GlobalValue &GV,
              SmallPtrSetImpl<const Comdat *> &NotDiscardableComdats,
+             const DenseSet<const Comdat *> &AliveComdats,
              function_ref<void(Function &)> DeleteFnCallback = nullptr) {
   GV.removeDeadConstantUsers();
 
@@ -1350,7 +1336,8 @@ deleteIfDead(GlobalValue &GV,
     return false;
 
   if (auto *C = GV.getComdat()) {
-    if (isComdatLeaderWithAliveMembers(&GV) ||
+    bool IsAliveLeader = C->getName() == GV.getName() && AliveComdats.count(C);
+    if (IsAliveLeader ||
         (!GV.hasInternalLinkage() && NotDiscardableComdats.count(C)))
       return false;
   }
@@ -1482,12 +1469,15 @@ static bool
 processInternalGlobal(GlobalVariable *GV, const GlobalStatus &GS,
                       function_ref<TargetTransformInfo &(Function &)> GetTTI,
                       function_ref<TargetLibraryInfo &(Function &)> GetTLI,
-                      function_ref<DominatorTree &(Function &)> LookupDomTree) {
+                      function_ref<DominatorTree &(Function &)> LookupDomTree,
+                      const DenseSet<const Comdat *> &AliveComdats) {
   // FOR COFF: Prevent SRA, localization, or substitution of COMDAT leaders
   // that have surviving associative members.
-  if (isComdatLeaderWithAliveMembers(GV))
-    return false;
-  
+  if (auto *C = GV->getComdat()) {
+    if (C->getName() == GV->getName() && AliveComdats.count(C))
+      return false;
+  }
+
   auto &DL = GV->getDataLayout();
   // If this is a first class global and has only one accessing function and
   // this function is non-recursive, we replace the global with a local alloca
@@ -1666,7 +1656,8 @@ static bool
 processGlobal(GlobalValue &GV,
               function_ref<TargetTransformInfo &(Function &)> GetTTI,
               function_ref<TargetLibraryInfo &(Function &)> GetTLI,
-              function_ref<DominatorTree &(Function &)> LookupDomTree) {
+              function_ref<DominatorTree &(Function &)> LookupDomTree,
+              const DenseSet<const Comdat *> &AliveComdats) {
   if (GV.getName().starts_with("llvm."))
     return false;
 
@@ -1697,7 +1688,7 @@ processGlobal(GlobalValue &GV,
   if (GVar->isConstant() || !GVar->hasInitializer())
     return Changed;
 
-  return processInternalGlobal(GVar, GS, GetTTI, GetTLI, LookupDomTree) ||
+  return processInternalGlobal(GVar, GS, GetTTI, GetTLI, LookupDomTree, AliveComdats) ||
          Changed;
 }
 
@@ -1952,6 +1943,7 @@ OptimizeFunctions(Module &M,
                   function_ref<BlockFrequencyInfo &(Function &)> GetBFI,
                   function_ref<DominatorTree &(Function &)> LookupDomTree,
                   SmallPtrSetImpl<const Comdat *> &NotDiscardableComdats,
+                  const DenseSet<const Comdat *> &AliveComdats,
                   function_ref<void(Function &F)> ChangedCFGCallback,
                   function_ref<void(Function &F)> DeleteFnCallback) {
 
@@ -1979,7 +1971,7 @@ OptimizeFunctions(Module &M,
     if (!F.hasName() && !F.isDeclaration() && !F.hasLocalLinkage())
       F.setLinkage(GlobalValue::InternalLinkage);
 
-    if (deleteIfDead(F, NotDiscardableComdats, DeleteFnCallback)) {
+    if (deleteIfDead(F, NotDiscardableComdats, AliveComdats, DeleteFnCallback)) {
       Changed = true;
       continue;
     }
@@ -2000,7 +1992,7 @@ OptimizeFunctions(Module &M,
       }
     }
 
-    Changed |= processGlobal(F, GetTTI, GetTLI, LookupDomTree);
+    Changed |= processGlobal(F, GetTTI, GetTLI, LookupDomTree, AliveComdats);
 
     if (!F.hasLocalLinkage())
       continue;
@@ -2079,7 +2071,8 @@ OptimizeGlobalVars(Module &M,
                    function_ref<TargetTransformInfo &(Function &)> GetTTI,
                    function_ref<TargetLibraryInfo &(Function &)> GetTLI,
                    function_ref<DominatorTree &(Function &)> LookupDomTree,
-                   SmallPtrSetImpl<const Comdat *> &NotDiscardableComdats) {
+                   SmallPtrSetImpl<const Comdat *> &NotDiscardableComdats,
+                   const DenseSet<const Comdat *> &AliveComdats) {
   bool Changed = false;
 
   for (GlobalVariable &GV : llvm::make_early_inc_range(M.globals())) {
@@ -2098,12 +2091,12 @@ OptimizeGlobalVars(Module &M,
         GV.setInitializer(New);
     }
 
-    if (deleteIfDead(GV, NotDiscardableComdats)) {
+    if (deleteIfDead(GV, NotDiscardableComdats, AliveComdats)) {
       Changed = true;
       continue;
     }
 
-    Changed |= processGlobal(GV, GetTTI, GetTLI, LookupDomTree);
+    Changed |= processGlobal(GV, GetTTI, GetTLI, LookupDomTree, AliveComdats);
   }
   return Changed;
 }
@@ -2296,6 +2289,7 @@ static bool hasUsesToReplace(GlobalAlias &GA, const LLVMUsed &U,
 
 static bool
 OptimizeGlobalAliases(Module &M,
+                      const DenseSet<const Comdat *> &AliveComdats,
                       SmallPtrSetImpl<const Comdat *> &NotDiscardableComdats) {
   bool Changed = false;
   LLVMUsed Used(M);
@@ -2315,7 +2309,7 @@ OptimizeGlobalAliases(Module &M,
     if (!J.hasName() && !J.isDeclaration() && !J.hasLocalLinkage())
       J.setLinkage(GlobalValue::InternalLinkage);
 
-    if (deleteIfDead(J, NotDiscardableComdats)) {
+    if (deleteIfDead(J, NotDiscardableComdats, AliveComdats)) {
       Changed = true;
       continue;
     }
@@ -2511,10 +2505,11 @@ static bool OptimizeStaticIFuncs(Module &M) {
 
 static bool
 DeleteDeadIFuncs(Module &M,
-                 SmallPtrSetImpl<const Comdat *> &NotDiscardableComdats) {
+                 SmallPtrSetImpl<const Comdat *> &NotDiscardableComdats,
+                 const DenseSet<const Comdat *> &AliveComdats) {
   bool Changed = false;
   for (GlobalIFunc &IF : make_early_inc_range(M.ifuncs()))
-    if (deleteIfDead(IF, NotDiscardableComdats)) {
+    if (deleteIfDead(IF, NotDiscardableComdats, AliveComdats)) {
       NumIFuncsDeleted++;
       Changed = true;
     }
@@ -2779,6 +2774,7 @@ optimizeGlobalsInModule(Module &M, const DataLayout &DL,
                         function_ref<void(Function &F)> ChangedCFGCallback,
                         function_ref<void(Function &F)> DeleteFnCallback) {
   SmallPtrSet<const Comdat *, 8> NotDiscardableComdats;
+  DenseSet<const Comdat *> AliveComdats;
   bool Changed = false;
   bool LocalChange = true;
   std::optional<uint32_t> FirstNotFullyEvaluatedPriority;
@@ -2787,6 +2783,19 @@ optimizeGlobalsInModule(Module &M, const DataLayout &DL,
     LocalChange = false;
 
     NotDiscardableComdats.clear();
+    AliveComdats.clear();
+
+    // Precomputation for COMDAT survival checks
+    for (const GlobalValue &Member : M.global_values()) {
+      if (const Comdat *C = Member.getComdat()) {
+        if (C->getName() != Member.getName()) {
+          if (!Member.use_empty() || !Member.isDiscardableIfUnused()) {
+            AliveComdats.insert(C);
+          }
+        }
+      }
+    }
+    
     for (const GlobalVariable &GV : M.globals())
       if (const Comdat *C = GV.getComdat())
         if (!GV.isDiscardableIfUnused() || !GV.use_empty())
@@ -2802,8 +2811,8 @@ optimizeGlobalsInModule(Module &M, const DataLayout &DL,
 
     // Delete functions that are trivially dead, ccc -> fastcc
     LocalChange |= OptimizeFunctions(M, GetTLI, GetTTI, GetBFI, LookupDomTree,
-                                     NotDiscardableComdats, ChangedCFGCallback,
-                                     DeleteFnCallback);
+                                     NotDiscardableComdats, AliveComdats,
+                                     ChangedCFGCallback, DeleteFnCallback);
 
     // Optimize global_ctors list.
     LocalChange |=
@@ -2819,10 +2828,10 @@ optimizeGlobalsInModule(Module &M, const DataLayout &DL,
 
     // Optimize non-address-taken globals.
     LocalChange |= OptimizeGlobalVars(M, GetTTI, GetTLI, LookupDomTree,
-                                      NotDiscardableComdats);
+                                      NotDiscardableComdats, AliveComdats);
 
     // Resolve aliases, when possible.
-    LocalChange |= OptimizeGlobalAliases(M, NotDiscardableComdats);
+    LocalChange |= OptimizeGlobalAliases(M, AliveComdats, NotDiscardableComdats);
 
     // Try to remove trivial global destructors if they are not removed
     // already.
@@ -2840,7 +2849,7 @@ optimizeGlobalsInModule(Module &M, const DataLayout &DL,
     LocalChange |= OptimizeNonTrivialIFuncs(M, GetTTI);
 
     // Remove any IFuncs that are now dead.
-    LocalChange |= DeleteDeadIFuncs(M, NotDiscardableComdats);
+    LocalChange |= DeleteDeadIFuncs(M, NotDiscardableComdats, AliveComdats);
 
     Changed |= LocalChange;
   }

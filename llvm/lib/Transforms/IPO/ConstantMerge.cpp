@@ -82,24 +82,10 @@ static Align getAlign(GlobalVariable *GV) {
       GV->getDataLayout().getPreferredAlign(GV));
 }
 
-static bool isComdatLeaderWithAliveMembers(GlobalVariable *GV, const SmallPtrSetImpl<const GlobalValue *> &UsedGlobals) {
-  if (const Comdat *C = GV->getComdat()) {
-    if (C->getName() == GV->getName()) {
-      for (const GlobalValue &Member : GV->getParent()->global_values()) {
-        if (Member.getComdat() == C && &Member != GV) {
-          if (!Member.use_empty() || !Member.isDiscardableIfUnused() || UsedGlobals.count(&Member)) {
-            return true;
-          }
-        }
-      }
-    }
-  }
-  return false;
-}
-
 static bool
 isUnmergeableGlobal(GlobalVariable *GV,
-                    const SmallPtrSetImpl<const GlobalValue *> &UsedGlobals) {
+                    const SmallPtrSetImpl<const GlobalValue *> &UsedGlobals,
+                    const DenseSet<const Comdat *> &AliveComdats) {
   // Only process constants with initializers in the default address space.
   if (!GV->isConstant() || !GV->hasDefinitiveInitializer() ||
       GV->getType()->getAddressSpace() != 0 || GV->hasSection() ||
@@ -110,8 +96,9 @@ isUnmergeableGlobal(GlobalVariable *GV,
     return true;
 
   // FOR COFF: Prevent ConstantMerge from merging and destroying COMDAT leaders
-  if (isComdatLeaderWithAliveMembers(GV, UsedGlobals))
-    return true;
+  if (const Comdat *C = GV->getComdat())
+    if (C->getName() == GV->getName() && AliveComdats.count(C))
+      return true;
 
   return false;
 }
@@ -163,6 +150,18 @@ static bool mergeConstants(Module &M) {
   FindUsedValues(M.getGlobalVariable("llvm.used"), UsedGlobals);
   FindUsedValues(M.getGlobalVariable("llvm.compiler.used"), UsedGlobals);
 
+  // FOR COFF: Precalculate COMDATs with alive non-leader members in O(N) time
+  DenseSet<const Comdat *> AliveComdats;
+  for (const GlobalValue &Member : M.global_values()) {
+    if (const Comdat *C = Member.getComdat()) {
+      if (C->getName() != Member.getName()) {
+        if (!Member.use_empty() || !Member.isDiscardableIfUnused() || UsedGlobals.count(&Member)) {
+          AliveComdats.insert(C);
+        }
+      }
+    }
+  }
+
   // Map unique constants to globals.
   DenseMap<Constant *, GlobalVariable *> CMap;
 
@@ -182,14 +181,18 @@ static bool mergeConstants(Module &M) {
       // If this GV is dead, remove it.
       GV.removeDeadConstantUsers();
       if (GV.use_empty() && GV.hasLocalLinkage()) {
-        if (!isComdatLeaderWithAliveMembers(&GV, UsedGlobals)) {
+        bool IsAliveLeader = false;
+        if (const Comdat *C = GV.getComdat())
+          IsAliveLeader = (C->getName() == GV.getName() && AliveComdats.count(C));
+        
+        if (!IsAliveLeader) {
           GV.eraseFromParent();
           ++ChangesMade;
           continue;
         }
       }
 
-      if (isUnmergeableGlobal(&GV, UsedGlobals))
+      if (isUnmergeableGlobal(&GV, UsedGlobals, AliveComdats))
         continue;
 
       // This transformation is legal for weak ODR globals in the sense it
@@ -224,7 +227,7 @@ static bool mergeConstants(Module &M) {
     // because doing so may cause initializers of other globals to be rewritten,
     // invalidating the Constant* pointers in CMap.
     for (GlobalVariable &GV : llvm::make_early_inc_range(M.globals())) {
-      if (isUnmergeableGlobal(&GV, UsedGlobals))
+      if (isUnmergeableGlobal(&GV, UsedGlobals, AliveComdats))
         continue;
 
       // We can only replace constant with local linkage.
