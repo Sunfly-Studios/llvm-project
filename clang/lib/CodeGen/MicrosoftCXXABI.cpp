@@ -2176,10 +2176,34 @@ MicrosoftCXXABI::EmitVirtualMemPtrThunk(const CXXMethodDecl *MD,
   llvm::Value *VTable =
       CGF.GetVTablePtr(getThisAddress(CGF), CGF.DefaultPtrTy, MD->getParent());
 
-  llvm::Value *VFuncPtr = CGF.Builder.CreateConstInBoundsGEP1_64(
-      ThunkPtrTy, VTable, ML.Index, "vfn");
-  llvm::Value *Callee =
-    CGF.Builder.CreateAlignedLoad(ThunkPtrTy, VFuncPtr, CGF.getPointerAlign());
+  // Compute the identity of the most derived class whose virtual table is
+  // located at the MethodVFTableLocation ML.
+  auto getObjectWithVPtr = [&] {
+    return llvm::find_if(CGM.getMicrosoftVTableContext().getVFPtrOffsets(
+                             ML.VBase ? ML.VBase : MD->getParent()),
+                         [&](const std::unique_ptr<VPtrInfo> &Info) {
+                           return Info->FullOffsetInMDC == ML.VFPtrOffset;
+                         })
+        ->get()
+        ->ObjectWithVPtr;
+  };
+
+  llvm::Value *Callee;
+  if (CGF.ShouldEmitVTableTypeCheckedLoad(MD->getParent())) {
+    Callee = CGF.EmitVTableTypeCheckedLoad(
+        getObjectWithVPtr(), VTable, ThunkPtrTy,
+        ML.Index *
+            CGM.getContext().getTargetInfo().getPointerWidth(LangAS::Default) /
+            8);
+  } else {
+    if (CGM.getCodeGenOpts().PrepareForLTO)
+      CGF.EmitTypeMetadataCodeForVCall(getObjectWithVPtr(), VTable, MD->getLocation());
+
+    llvm::Value *VFuncPtr = CGF.Builder.CreateConstInBoundsGEP1_64(
+        ThunkPtrTy, VTable, ML.Index, "vfn");
+    Callee =
+      CGF.Builder.CreateAlignedLoad(ThunkPtrTy, VFuncPtr, CGF.getPointerAlign());
+  }
 
   CGF.EmitMustTailThunk(MD, getThisValue(CGF), {ThunkTy, Callee});
 
